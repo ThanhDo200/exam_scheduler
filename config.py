@@ -18,6 +18,7 @@ FAIRNESS_WEIGHT = 2000.0               # Ưu tiên fairness (minimize max-min sh
 DISTANCE_WEIGHT = 300.0                # Ưu tiên minimize khoảng cách
 GENDER_WEIGHT = 100.0                  # Nữ trực ít hơn nam (weight cao)
 AGE_WEIGHT = 200.0                     # Cán bộ cao tuổi trực ít hơn
+OVERLAP_WEIGHT = 500.0                 # Penalize overlapping shifts on same day at same facility
 
 
 # Gender mapping

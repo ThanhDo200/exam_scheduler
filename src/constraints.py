@@ -40,6 +40,9 @@ def add_objective(prob, assignment_vars, staff_data, shift_data):
 
     fairness_cost = get_fairness_penalty(prob, assignment_vars, staff_data, shift_data)
     objective += fairness_cost
+    
+    overlap_cost = get_overlap_penalty(assignment_vars, staff_data, shift_data)
+    objective += overlap_cost
 
     prob += objective, "Total_Cost"
     return prob
@@ -74,6 +77,56 @@ def get_fairness_penalty(prob, assignment_vars, staff_data, shift_data):
         fairness_cost += config.FAIRNESS_WEIGHT * (over + under)
 
     return fairness_cost
+
+
+def get_overlap_penalty(assignment_vars, staff_data, shift_data):
+    # Penalize overlapping shifts on the same day at the same facility
+    # Extract date from MS_ca (format: YYYYMMDD_X, take part before "_")
+    
+    if 'MS_ca' not in shift_data.columns or 'Cơ sở' not in shift_data.columns:
+        return 0
+    
+    shift_lookup = shift_data.set_index('UNIQUE_KEY')
+    overlap_cost = 0
+    
+    for cb in staff_data['MS_CB']:
+        if cb not in assignment_vars:
+            continue
+        
+        # Get all shifts assigned to this staff member
+        assigned_shifts = [ca for ca in assignment_vars[cb] 
+                          if assignment_vars[cb][ca].varValue == 1 
+                          or (hasattr(assignment_vars[cb][ca], 'upBound') 
+                              and assignment_vars[cb][ca].upBound == 1)]
+        
+        if len(assigned_shifts) <= 1:
+            continue
+        
+        # Group shifts by date
+        date_facility_count = {}
+        for ca in assigned_shifts:
+            if ca not in shift_lookup.index:
+                continue
+            
+            shift_row = shift_lookup.loc[ca]
+            # Extract date from MS_ca (part before "_")
+            ms_ca = str(shift_row.get('MS_ca', ''))
+            date_str = ms_ca.split('_')[0] if '_' in ms_ca else ms_ca
+            facility = shift_row.get('Cơ sở', '')
+            
+            key = (date_str, facility)
+            date_facility_count[key] = date_facility_count.get(key, 0) + 1
+        
+        # Calculate penalty: from 2nd occurrence onwards
+        # 1st occurrence: 0 penalty
+        # 2nd occurrence: +1 penalty
+        # 3rd occurrence: +2 penalty, etc.
+        for (date_str, facility), count in date_facility_count.items():
+            if count >= 2:
+                penalty = count - 1  # 2 shifts -> 1 penalty, 3 shifts -> 2 penalty
+                overlap_cost += config.OVERLAP_WEIGHT * penalty if hasattr(config, 'OVERLAP_WEIGHT') else penalty
+    
+    return overlap_cost
 
 
 def get_distance_penalty(assignment_vars, staff_data, shift_data):
