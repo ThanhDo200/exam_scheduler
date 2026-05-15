@@ -27,7 +27,19 @@ def add_hard_constraints(prob, assignment_vars, staff_data, shift_data):
         if staff_in_shift:
             prob += sum(staff_in_shift) == num_staff, f"exact_people_shift_{ca}"
 
-    print("OK Hard constraints added: exact people per shift")
+    if 'MS_CA' in shift_data.columns:
+        ms_ca_groups = shift_data.groupby('MS_CA')['UNIQUE_KEY'].apply(list).to_dict()
+        for cb in staff_data['MS_CB']:
+            if cb not in assignment_vars:
+                continue
+            for ms_ca, unique_keys in ms_ca_groups.items():
+                assigned_same_time = [assignment_vars[cb][ca]
+                                      for ca in unique_keys
+                                      if ca in assignment_vars[cb]]
+                if assigned_same_time:
+                    prob += sum(assigned_same_time) <= 1, f"no_duplicate_ms_ca_{cb}_{ms_ca}"
+
+    print("OK Hard constraints added: exact people per shift and no duplicate MS_CA per staff")
     return prob
 
 
@@ -38,11 +50,9 @@ def add_objective(prob, assignment_vars, staff_data, shift_data):
     objective += get_gender_penalty(assignment_vars, staff_data, shift_data)
     objective += get_age_penalty(assignment_vars, staff_data, shift_data)
 
-    fairness_cost = get_fairness_penalty(prob, assignment_vars, staff_data, shift_data)
-    objective += fairness_cost
-    
-    overlap_cost = get_overlap_penalty(assignment_vars, staff_data, shift_data)
-    objective += overlap_cost
+    objective += get_fairness_penalty(prob, assignment_vars, staff_data, shift_data)
+    objective += get_same_day_diff_facility_penalty(prob, assignment_vars, staff_data, shift_data)
+    objective += get_rest_gap_penalty(prob, assignment_vars, staff_data, shift_data)
 
     prob += objective, "Total_Cost"
     return prob
@@ -79,54 +89,125 @@ def get_fairness_penalty(prob, assignment_vars, staff_data, shift_data):
     return fairness_cost
 
 
-def get_overlap_penalty(assignment_vars, staff_data, shift_data):
-    # Penalize overlapping shifts on the same day at the same facility
-    # Extract date from MS_ca (format: YYYYMMDD_X, take part before "_")
+def get_same_day_diff_facility_penalty(prob, assignment_vars, staff_data, shift_data):
     
-    if 'MS_ca' not in shift_data.columns or 'Cơ sở' not in shift_data.columns:
+    if 'MS_CA' not in shift_data.columns or 'Cơ sở' not in shift_data.columns:
         return 0
-    
+
     shift_lookup = shift_data.set_index('UNIQUE_KEY')
-    overlap_cost = 0
-    
+    diff_fac_cost = 0
+
     for cb in staff_data['MS_CB']:
         if cb not in assignment_vars:
             continue
-        
-        # Get all shifts assigned to this staff member
-        assigned_shifts = [ca for ca in assignment_vars[cb] 
-                          if assignment_vars[cb][ca].varValue == 1 
-                          or (hasattr(assignment_vars[cb][ca], 'upBound') 
-                              and assignment_vars[cb][ca].upBound == 1)]
-        
-        if len(assigned_shifts) <= 1:
-            continue
-        
-        # Group shifts by date
-        date_facility_count = {}
-        for ca in assigned_shifts:
-            if ca not in shift_lookup.index:
+
+        facility_date_groups = {}
+        for ca in shift_data['UNIQUE_KEY']:
+            if ca not in assignment_vars[cb]:
                 continue
-            
             shift_row = shift_lookup.loc[ca]
-            # Extract date from MS_ca (part before "_")
-            ms_ca = str(shift_row.get('MS_ca', ''))
+            ms_ca = str(shift_row.get('MS_CA', ''))
             date_str = ms_ca.split('_')[0] if '_' in ms_ca else ms_ca
             facility = shift_row.get('Cơ sở', '')
-            
-            key = (date_str, facility)
-            date_facility_count[key] = date_facility_count.get(key, 0) + 1
-        
-        # Calculate penalty: from 2nd occurrence onwards
-        # 1st occurrence: 0 penalty
-        # 2nd occurrence: +1 penalty
-        # 3rd occurrence: +2 penalty, etc.
-        for (date_str, facility), count in date_facility_count.items():
-            if count >= 2:
-                penalty = count - 1  # 2 shifts -> 1 penalty, 3 shifts -> 2 penalty
-                overlap_cost += config.OVERLAP_WEIGHT * penalty if hasattr(config, 'OVERLAP_WEIGHT') else penalty
-    
-    return overlap_cost
+            facility_date_groups.setdefault((cb, date_str, facility), []).append(ca)
+
+        used_fac_vars = {}
+        for (cb_key, date_str, facility), cas in facility_date_groups.items():
+            used_fac = LpVariable(f"used_fac_{cb_key}_{date_str}_{facility}", cat='Binary')
+            used_fac_vars[(cb_key, date_str, facility)] = used_fac
+            for ca in cas:
+                prob += used_fac >= assignment_vars[cb][ca], f"used_fac_lower_{cb_key}_{date_str}_{facility}_{ca}"
+            prob += used_fac <= sum(assignment_vars[cb][ca] for ca in cas), f"used_fac_upper_{cb_key}_{date_str}_{facility}"
+
+        date_facility_counts = {}
+        for (cb_key, date_str, facility), cas in facility_date_groups.items():
+            date_facility_counts.setdefault((cb_key, date_str), []).append(facility)
+
+        for (cb_key, date_str), facilities in date_facility_counts.items():
+            used_vars = [used_fac_vars[(cb_key, date_str, facility)] for facility in facilities]
+            # If there are only two facilities on that date, create a single binary
+            # that indicates both facilities are used (and penalize it). This avoids
+            # introducing a continuous 'over' variable and reduces model size.
+            if len(used_vars) == 2:
+                a, b = used_vars
+                both_used = LpVariable(f"same_day_diff_fac_both_{cb_key}_{date_str}", cat='Binary')
+                prob += both_used <= a, f"same_day_diff_fac_both_le_{cb_key}_{date_str}_a"
+                prob += both_used <= b, f"same_day_diff_fac_both_le_{cb_key}_{date_str}_b"
+                prob += both_used >= a + b - 1, f"same_day_diff_fac_both_ge_{cb_key}_{date_str}"
+                diff_fac_cost += config.SAME_DAY_DIFF_FACILITY_WEIGHT * both_used
+            else:
+                # Fallback for >2 facilities: keep simple continuous over variable
+                facility_count = sum(used_vars)
+                over_fac = LpVariable(f"same_day_diff_fac_over_{cb_key}_{date_str}", lowBound=0, cat='Continuous')
+                prob += facility_count - 1 <= over_fac, f"same_day_diff_fac_over_constr_{cb_key}_{date_str}"
+                diff_fac_cost += config.SAME_DAY_DIFF_FACILITY_WEIGHT * over_fac
+
+    return diff_fac_cost
+
+
+def get_rest_gap_penalty(prob, assignment_vars, staff_data, shift_data):
+
+    if 'MS_CA' not in shift_data.columns:
+        return 0
+
+    time_map = {}
+    for _, row in shift_data[['UNIQUE_KEY', 'MS_CA']].iterrows():
+        ms_ca = str(row['MS_CA']).strip()
+        normalized = ms_ca.replace('_', '')
+        try:
+            time_map[row['UNIQUE_KEY']] = int(normalized)
+        except ValueError:
+            continue
+
+    if not time_map:
+        return 0
+
+    unique_times = sorted(set(time_map.values()))
+    if len(unique_times) < 2:
+        return 0
+
+    rest_cost = 0
+    time_vars = {}
+
+    for cb in staff_data['MS_CB']:
+        time_vars[cb] = {}
+        for time_code in unique_times:
+            time_vars[cb][time_code] = LpVariable(f"time_assign_{cb}_{time_code}", cat='Binary')
+
+    # Link time assignment vars to shift assignments
+    for cb in staff_data['MS_CB']:
+        if cb not in assignment_vars:
+            continue
+
+        for ca, time_code in time_map.items():
+            if ca not in assignment_vars[cb]:
+                continue
+            prob += time_vars[cb][time_code] >= assignment_vars[cb][ca], f"time_assign_lower_{cb}_{ca}"
+
+        for time_code in unique_times:
+            related_shifts = [ca for ca, tcode in time_map.items() if tcode == time_code and ca in assignment_vars[cb]]
+            if not related_shifts:
+                prob += time_vars[cb][time_code] == 0, f"time_assign_no_shifts_{cb}_{time_code}"
+                continue
+            prob += time_vars[cb][time_code] <= sum(assignment_vars[cb][ca] for ca in related_shifts), f"time_assign_upper_{cb}_{time_code}"
+
+    # Only consider adjacent time codes to reduce variable/rule explosion
+    for cb in staff_data['MS_CB']:
+        if cb not in assignment_vars:
+            continue
+
+        for i in range(len(unique_times) - 1):
+            first = unique_times[i]
+            second = unique_times[i + 1]
+            adj = LpVariable(f"rest_adj_{cb}_{first}_{second}", cat='Binary')
+            prob += adj <= time_vars[cb][first], f"rest_adj_up1_{cb}_{first}_{second}"
+            prob += adj <= time_vars[cb][second], f"rest_adj_up2_{cb}_{first}_{second}"
+            prob += adj >= time_vars[cb][first] + time_vars[cb][second] - 1, f"rest_adj_low_{cb}_{first}_{second}"
+
+            gap = second - first
+            rest_cost += config.REST_TIME_WEIGHT * gap * adj
+
+    return rest_cost
 
 
 def get_distance_penalty(assignment_vars, staff_data, shift_data):

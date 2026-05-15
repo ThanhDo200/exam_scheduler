@@ -15,10 +15,11 @@ OUTPUT_SCHEDULE_FILE = os.path.join(OUTPUT_DIR, 'lich_truc_final.xlsx')
 
 # Soft constraint weights (objective function)
 FAIRNESS_WEIGHT = 2000.0               # Ưu tiên fairness (minimize max-min shifts)
-DISTANCE_WEIGHT = 300.0                # Ưu tiên minimize khoảng cách
+DISTANCE_WEIGHT = 200.0                # Ưu tiên minimize khoảng cách
 GENDER_WEIGHT = 100.0                  # Nữ trực ít hơn nam (weight cao)
-AGE_WEIGHT = 200.0                     # Cán bộ cao tuổi trực ít hơn
-OVERLAP_WEIGHT = 500.0                 # Penalize overlapping shifts on same day at same facility
+AGE_WEIGHT = 300.0                     # Cán bộ cao tuổi trực ít hơn
+REST_TIME_WEIGHT = -400.0             # Negative weight to maximize rest gap between assigned MS_CA slots
+SAME_DAY_DIFF_FACILITY_WEIGHT = 600.0  # Penalize multiple shifts same day across different facilities
 
 
 # Gender mapping
