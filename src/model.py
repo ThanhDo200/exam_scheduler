@@ -38,11 +38,19 @@ class ExamSchedulerModel:
             raise ValueError("Model not created yet. Call create_model() first.")
 
         print("\nSolving model ...")
-        solver = PULP_CBC_CMD(msg=1, timeLimit=timeout) if timeout is not None else PULP_CBC_CMD(msg=1)
+        # Always create the CBC solver without a time limit so it can run to completion
+        solver = PULP_CBC_CMD(msg=1)
         status = self.prob.solve(solver)
 
         print(f"OK Model solved with status: {LpStatus[status]}")
-        print(f"  Objective value: {value(self.prob.objective):.2f}")
+        try:
+            obj_val = value(self.prob.objective)
+            if obj_val is not None:
+                print(f"  Objective value: {obj_val:.2f}")
+            else:
+                print("  Objective value: None")
+        except Exception:
+            print("  Objective value: unavailable")
         return status
 
     def extract_solution(self):

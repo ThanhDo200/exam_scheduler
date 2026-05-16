@@ -3,7 +3,8 @@ constraints.py - Define hard and soft constraints for the scheduling model
 """
 import config
 import pandas as pd
-from pulp import LpVariable
+from itertools import combinations
+from pulp import LpVariable, lpSum
 
 FACILITY_DISTANCE_MAP = {
     'Cơ sở 1': 'KC CS1 (km)',
@@ -39,7 +40,39 @@ def add_hard_constraints(prob, assignment_vars, staff_data, shift_data):
                 if assigned_same_time:
                     prob += sum(assigned_same_time) <= 1, f"no_duplicate_ms_ca_{cb}_{ms_ca}"
 
-    print("OK Hard constraints added: exact people per shift and no duplicate MS_CA per staff")
+    if 'MS_CA' in shift_data.columns and 'Cơ sở' in shift_data.columns:
+        shift_lookup = shift_data.set_index('UNIQUE_KEY')
+        for cb in staff_data['MS_CB']:
+            if cb not in assignment_vars:
+                continue
+
+            shifts_by_date = {}
+            for ca in shift_data['UNIQUE_KEY']:
+                if ca not in assignment_vars[cb]:
+                    continue
+                row = shift_lookup.loc[ca]
+                ms_ca = str(row.get('MS_CA', ''))
+                date_str = ms_ca.split('_')[0] if '_' in ms_ca else ms_ca
+                facility = row.get('Cơ sở', '')
+                time_code = 0
+                try:
+                    time_code = int(ms_ca.replace('_', ''))
+                except ValueError:
+                    pass
+                shifts_by_date.setdefault(date_str, []).append((time_code, ca, facility))
+
+            for date_str, entries in shifts_by_date.items():
+                entries.sort(key=lambda x: x[0])
+                for i in range(len(entries) - 1):
+                    first_ca = entries[i][1]
+                    first_fac = entries[i][2]
+                    second_ca = entries[i + 1][1]
+                    second_fac = entries[i + 1][2]
+                    if first_fac and second_fac and first_fac != second_fac:
+                        prob += assignment_vars[cb][first_ca] + assignment_vars[cb][second_ca] <= 1, \
+                                 f"no_consecutive_diff_fac_{cb}_{date_str}_{first_ca}_{second_ca}"
+
+    print("OK Hard constraints added: exact people per shift, no duplicate MS_CA per staff, and no consecutive different-facility shifts")
     return prob
 
 
@@ -51,6 +84,10 @@ def add_objective(prob, assignment_vars, staff_data, shift_data):
     objective += get_age_penalty(assignment_vars, staff_data, shift_data)
 
     objective += get_fairness_penalty(prob, assignment_vars, staff_data, shift_data)
+    objective += get_min_shift_penalty(prob, assignment_vars, staff_data, shift_data)
+    objective += get_weekend_penalty(assignment_vars, staff_data, shift_data)
+    # Partner diversity penalty: count total co-assigned shifts per staff-pair
+    objective += get_partner_diversity_penalty(prob, assignment_vars, staff_data, shift_data)
     objective += get_same_day_diff_facility_penalty(prob, assignment_vars, staff_data, shift_data)
     objective += get_rest_gap_penalty(prob, assignment_vars, staff_data, shift_data)
 
@@ -59,7 +96,7 @@ def add_objective(prob, assignment_vars, staff_data, shift_data):
 
 
 def get_fairness_penalty(prob, assignment_vars, staff_data, shift_data):
-    # Penalize deviation from the average shift load per staff.
+
     total_required = 0
     if 'Số cán bộ cần thiết' in shift_data.columns:
         total_required = int(shift_data['Số cán bộ cần thiết'].fillna(1).sum())
@@ -82,11 +119,87 @@ def get_fairness_penalty(prob, assignment_vars, staff_data, shift_data):
 
         prob += shift_sum - avg_shifts <= over, f"fairness_over_{cb}"
         prob += avg_shifts - shift_sum <= under, f"fairness_under_{cb}"
-        prob += shift_sum >= 1, f"min_shift_count_{cb}"
 
         fairness_cost += config.FAIRNESS_WEIGHT * (over + under)
 
     return fairness_cost
+
+
+def get_min_shift_penalty(prob, assignment_vars, staff_data, shift_data):
+    min_shift_cost = 0
+
+    for cb in staff_data['MS_CB']:
+        staff_shifts = [assignment_vars[cb][ca]
+                        for ca in shift_data['UNIQUE_KEY']
+                        if ca in assignment_vars[cb]]
+        if not staff_shifts:
+            continue
+
+        shift_sum = sum(staff_shifts)
+        min_shift_violation = LpVariable(f"min_shift_violation_{cb}", lowBound=0, cat='Continuous')
+        prob += 1 - shift_sum <= min_shift_violation, f"min_shift_violation_def_{cb}"
+        min_shift_cost += config.MIN_SHIFT_WEIGHT * min_shift_violation
+
+    return min_shift_cost
+
+def get_weekend_penalty(assignment_vars, staff_data, shift_data):
+
+    if 'Thứ' not in shift_data.columns:
+        return 0
+
+    # Map UNIQUE_KEY -> day string
+    day_map = shift_data.set_index('UNIQUE_KEY')['Thứ'].to_dict()
+    weekend_keys = set()
+    for uk, val in day_map.items():
+        s = ' '.join(str(val).strip().lower().split())
+        if not s:
+            continue
+        if s in ('Thứ 7', 'Chủ Nhật'):
+            weekend_keys.add(uk)
+
+    if not weekend_keys:
+        return 0
+
+    weekend_cost = 0
+    for cb in staff_data['MS_CB']:
+        if cb not in assignment_vars:
+            continue
+        for ca in weekend_keys:
+            if ca in assignment_vars[cb]:
+                weekend_cost += config.WEEKEND_WEIGHT * assignment_vars[cb].get(ca, 0)
+
+    return weekend_cost
+
+
+def get_partner_diversity_penalty(prob, assignment_vars, staff_data, shift_data):
+    if len(staff_data) < 2 or 'UNIQUE_KEY' not in shift_data.columns:
+        return 0
+
+    partner_cost = 0
+    staff_list = staff_data['MS_CB'].tolist()
+
+    for cb1, cb2 in combinations(staff_list, 2):
+        if cb1 not in assignment_vars or cb2 not in assignment_vars:
+            continue
+
+        common_vars = []
+        for ca in shift_data['UNIQUE_KEY']:
+            if ca in assignment_vars[cb1] and ca in assignment_vars[cb2]:
+                common_var = LpVariable(f"pair_common_{cb1}_{cb2}_{ca}", cat='Binary')
+                prob += common_var <= assignment_vars[cb1][ca], f"pair_common_le1_{cb1}_{cb2}_{ca}"
+                prob += common_var <= assignment_vars[cb2][ca], f"pair_common_le2_{cb1}_{cb2}_{ca}"
+                prob += common_var >= assignment_vars[cb1][ca] + assignment_vars[cb2][ca] - 1, f"pair_common_ge_{cb1}_{cb2}_{ca}"
+                common_vars.append(common_var)
+
+        if not common_vars:
+            continue
+
+        co_sum = lpSum(common_vars)
+        pair_cost = LpVariable(f"pair_cost_{cb1}_{cb2}", lowBound=0, cat='Continuous')
+        prob += pair_cost >= co_sum - 1, f"pair_cost_def_{cb1}_{cb2}"
+        partner_cost += config.PARTNER_DIVERSITY_WEIGHT * pair_cost
+
+    return partner_cost
 
 
 def get_same_day_diff_facility_penalty(prob, assignment_vars, staff_data, shift_data):
@@ -125,9 +238,6 @@ def get_same_day_diff_facility_penalty(prob, assignment_vars, staff_data, shift_
 
         for (cb_key, date_str), facilities in date_facility_counts.items():
             used_vars = [used_fac_vars[(cb_key, date_str, facility)] for facility in facilities]
-            # If there are only two facilities on that date, create a single binary
-            # that indicates both facilities are used (and penalize it). This avoids
-            # introducing a continuous 'over' variable and reduces model size.
             if len(used_vars) == 2:
                 a, b = used_vars
                 both_used = LpVariable(f"same_day_diff_fac_both_{cb_key}_{date_str}", cat='Binary')
@@ -136,7 +246,6 @@ def get_same_day_diff_facility_penalty(prob, assignment_vars, staff_data, shift_
                 prob += both_used >= a + b - 1, f"same_day_diff_fac_both_ge_{cb_key}_{date_str}"
                 diff_fac_cost += config.SAME_DAY_DIFF_FACILITY_WEIGHT * both_used
             else:
-                # Fallback for >2 facilities: keep simple continuous over variable
                 facility_count = sum(used_vars)
                 over_fac = LpVariable(f"same_day_diff_fac_over_{cb_key}_{date_str}", lowBound=0, cat='Continuous')
                 prob += facility_count - 1 <= over_fac, f"same_day_diff_fac_over_constr_{cb_key}_{date_str}"
@@ -150,62 +259,45 @@ def get_rest_gap_penalty(prob, assignment_vars, staff_data, shift_data):
     if 'MS_CA' not in shift_data.columns:
         return 0
 
-    time_map = {}
-    for _, row in shift_data[['UNIQUE_KEY', 'MS_CA']].iterrows():
-        ms_ca = str(row['MS_CA']).strip()
-        normalized = ms_ca.replace('_', '')
+    date_time_map = {}
+    for uk, ms_ca in shift_data.set_index('UNIQUE_KEY')['MS_CA'].dropna().items():
+        ms_ca = str(ms_ca).strip()
+        if '_' not in ms_ca:
+            continue
+        date_str, time_code_str = ms_ca.split('_', 1)
         try:
-            time_map[row['UNIQUE_KEY']] = int(normalized)
+            date_time_map[uk] = (date_str, int(time_code_str))
         except ValueError:
             continue
 
-    if not time_map:
-        return 0
-
-    unique_times = sorted(set(time_map.values()))
-    if len(unique_times) < 2:
+    if not date_time_map:
         return 0
 
     rest_cost = 0
-    time_vars = {}
-
-    for cb in staff_data['MS_CB']:
-        time_vars[cb] = {}
-        for time_code in unique_times:
-            time_vars[cb][time_code] = LpVariable(f"time_assign_{cb}_{time_code}", cat='Binary')
-
-    # Link time assignment vars to shift assignments
     for cb in staff_data['MS_CB']:
         if cb not in assignment_vars:
             continue
 
-        for ca, time_code in time_map.items():
-            if ca not in assignment_vars[cb]:
-                continue
-            prob += time_vars[cb][time_code] >= assignment_vars[cb][ca], f"time_assign_lower_{cb}_{ca}"
+        shifts_by_date = {}
+        for uk, (date_str, time_code) in date_time_map.items():
+            if uk in assignment_vars[cb]:
+                shifts_by_date.setdefault(date_str, []).append((time_code, uk))
 
-        for time_code in unique_times:
-            related_shifts = [ca for ca, tcode in time_map.items() if tcode == time_code and ca in assignment_vars[cb]]
-            if not related_shifts:
-                prob += time_vars[cb][time_code] == 0, f"time_assign_no_shifts_{cb}_{time_code}"
-                continue
-            prob += time_vars[cb][time_code] <= sum(assignment_vars[cb][ca] for ca in related_shifts), f"time_assign_upper_{cb}_{time_code}"
-
-    # Only consider adjacent time codes to reduce variable/rule explosion
-    for cb in staff_data['MS_CB']:
-        if cb not in assignment_vars:
-            continue
-
-        for i in range(len(unique_times) - 1):
-            first = unique_times[i]
-            second = unique_times[i + 1]
-            adj = LpVariable(f"rest_adj_{cb}_{first}_{second}", cat='Binary')
-            prob += adj <= time_vars[cb][first], f"rest_adj_up1_{cb}_{first}_{second}"
-            prob += adj <= time_vars[cb][second], f"rest_adj_up2_{cb}_{first}_{second}"
-            prob += adj >= time_vars[cb][first] + time_vars[cb][second] - 1, f"rest_adj_low_{cb}_{first}_{second}"
-
-            gap = second - first
-            rest_cost += config.REST_TIME_WEIGHT * gap * adj
+        for date_str, entries in shifts_by_date.items():
+            entries.sort()
+            for i, (first_time, first_uk) in enumerate(entries):
+                for second_time, second_uk in entries[i + 1:]:
+                    gap = second_time - first_time
+                    if gap > 2:
+                        break
+                    close_var = LpVariable(
+                        f"rest_close_{cb}_{date_str}_{first_time}_{second_time}_{first_uk}_{second_uk}",
+                        cat='Binary'
+                    )
+                    prob += close_var <= assignment_vars[cb][first_uk], f"rest_close_le1_{cb}_{date_str}_{first_time}_{second_time}_{first_uk}_{second_uk}"
+                    prob += close_var <= assignment_vars[cb][second_uk], f"rest_close_le2_{cb}_{date_str}_{first_time}_{second_time}_{first_uk}_{second_uk}"
+                    prob += close_var >= assignment_vars[cb][first_uk] + assignment_vars[cb][second_uk] - 1, f"rest_close_ge_{cb}_{date_str}_{first_time}_{second_time}_{first_uk}_{second_uk}"
+                    rest_cost += config.CLOSE_SHIFT_WEIGHT * close_var
 
     return rest_cost
 
@@ -265,7 +357,7 @@ def get_age_penalty(assignment_vars, staff_data, shift_data):
     age_cost = 0
 
     for cb, age in ages.items():
-        if pd.isna(age) or age < 55:
+        if pd.isna(age) or age < 45:
             continue
 
         age_penalty = config.AGE_WEIGHT * (age - 50) / 10
